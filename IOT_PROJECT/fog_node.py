@@ -149,28 +149,32 @@ class FogNode:
 
         @self.app.route("/security_event", methods=["POST"])
         def proxy_security_event():
-            data = request.get_json(silent=True) or {}
-            resp = self.server_request(
-                "POST",
-                "/api/security_log",
-                json=data,
-            )
+            data = request.get_json(force=True) or {}
             print(
                 f"[FOG PROXY] security_event {data.get('attack_type')} from {data.get('node_id')}",
                 flush=True,
             )
-            return self.make_proxy_response(resp)
+            # Fire and forget — never block fog on a slow/down server
+            def send_async():
+                try:
+                    self.server_request("POST", "/api/security_log", json=data)
+                except Exception:
+                    pass  # Server down — ignore
+            threading.Thread(target=send_async, daemon=True).start()
+            return jsonify({"status": "queued"}), 200
 
         @self.app.route("/l7_alert", methods=["POST"])
         def proxy_l7_alert():
-            data = request.get_json(silent=True) or {}
-            resp = self.server_request(
-                "POST",
-                "/api/l7_alert",
-                json=data,
-            )
+            data = request.get_json(force=True) or {}
             print(f"[FOG PROXY] L7 alert from {data.get('node_id')}", flush=True)
-            return self.make_proxy_response(resp)
+            # Fire and forget — never block fog on a slow/down server
+            def send_async():
+                try:
+                    self.server_request("POST", "/api/l7_alert", json=data)
+                except Exception:
+                    pass  # Server down — ignore
+            threading.Thread(target=send_async, daemon=True).start()
+            return jsonify({"status": "queued"}), 200
 
         @self.app.post("/relay_image")
         def relay_image():
@@ -259,7 +263,7 @@ class FogNode:
                 method,
                 url,
                 headers=headers,
-                timeout=10,
+                timeout=3,
                 **kwargs,
             )
         except requests.RequestException as exc:
@@ -277,7 +281,7 @@ class FogNode:
                     method,
                     url,
                     headers=headers,
-                    timeout=10,
+                    timeout=3,
                     **kwargs,
                 )
             except requests.RequestException as exc:
@@ -593,18 +597,28 @@ class FogNode:
         log("FOG DOWNLINK", f"server broker disconnected: rc={rc}")
 
     def on_edge_message(self, client, userdata, msg):
-        log("FOG UPLINK", f"message received: topic={msg.topic} bytes={len(msg.payload)}")
-        allowed, node_id, _ = self.run_uplink_security_checks(msg.topic, msg.payload)
+        topic = msg.topic
+        # Never forward commands upstream — commands only flow server → edge
+        if "/command" in topic:
+            return
+        if "/challenge" in topic:
+            return
+        log("FOG UPLINK", f"message received: topic={topic} bytes={len(msg.payload)}")
+        allowed, node_id, _ = self.run_uplink_security_checks(topic, msg.payload)
         if not allowed:
             return
 
         anomaly_flag = False
         with self.state_lock:
             anomaly_flag = len(self.anomaly_tracker[node_id]) > ANOMALY_EVENT_THRESHOLD
-        self.forward_uplink(msg.topic, msg.payload, anomaly_flag)
+        self.forward_uplink(topic, msg.payload, anomaly_flag)
 
     def on_server_message(self, client, userdata, msg):
-        node_id = self.extract_node_id(msg.topic) or "unknown"
+        topic = msg.topic
+        # Only forward commands downstream — heartbeats/events must not loop back
+        if "/command" not in topic:
+            return
+        node_id = self.extract_node_id(topic) or "unknown"
         payload = self.parse_json_payload(msg.payload)
         command = payload.get("command") if isinstance(payload, dict) else None
 
@@ -613,7 +627,7 @@ class FogNode:
             self.post_security_log("server", "unknown_command", f"command={command}", blocked=True)
             return
 
-        info = self.client_edge.publish(msg.topic, msg.payload)
+        info = self.client_edge.publish(topic, msg.payload)
         if info.rc == mqtt.MQTT_ERR_SUCCESS:
             log("FOG DOWNLINK", f"command={command} -> node={node_id}")
         else:
@@ -700,8 +714,10 @@ class FogNode:
         log("FOG BRIDGE", f"server broker disconnected: rc={rc}")
 
     def on_bridge_local_message(self, client, userdata, msg):
-        # Avoid looping server-issued commands back upstream.
-        if msg.topic.endswith("/command"):
+        # Never forward commands or challenges upstream — these only flow server → edge
+        if "/command" in msg.topic:
+            return
+        if "/challenge" in msg.topic:
             return
         if self.bridge_to_server is None:
             return
@@ -732,15 +748,36 @@ class FogNode:
 
     def buffer_retry_loop(self):
         while not self.stop_event.is_set():
-            pending_rows = self.get_pending_messages()
-            retried = 0
-            for row_id, topic, payload_text in pending_rows:
-                info = self.client_server.publish(topic, payload_text.encode("utf-8"))
-                if info.rc == mqtt.MQTT_ERR_SUCCESS:
-                    self.mark_forwarded(row_id)
-                    retried += 1
-            log("FOG BUFFER", f"{len(pending_rows)} pending, {retried} retried")
             self.stop_event.wait(BUFFER_RETRY_INTERVAL_SECS)
+            # Ensure upstream is connected before attempting retries (rc=4 = MQTT_ERR_NO_CONN)
+            if not self.client_server.is_connected():
+                try:
+                    self.client_server.reconnect()
+                    log("FOG BRIDGE", "upstream reconnected")
+                except Exception as exc:
+                    log("FOG BRIDGE", f"reconnect failed: {exc}")
+                    continue
+
+            conn = sqlite3.connect(BUFFER_DB)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, topic, payload FROM buffer WHERE forwarded=0 LIMIT 10"
+            )
+            rows = cur.fetchall()
+            retried = 0
+            for row_id, topic, payload in rows:
+                try:
+                    result = self.client_server.publish(topic, payload.encode("utf-8"), qos=0)
+                    if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                        cur.execute("UPDATE buffer SET forwarded=1 WHERE id=?", (row_id,))
+                        retried += 1
+                except Exception:
+                    pass
+            conn.commit()
+            conn.close()
+            if rows:
+                pending = len(rows) - retried
+                log("FOG BUFFER", f"{pending} pending, {retried} retried")
 
     def cache_refresh_loop(self):
         while not self.stop_event.is_set():

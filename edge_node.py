@@ -63,8 +63,8 @@ RATE_LIMIT_PER_SEC = 10
 REPLAY_WINDOW_SECS = 30
 REPLAY_WINDOW_SIZE = 1000
 CHALLENGE_INTERVAL_SECS = 300
-CHALLENGE_TIMEOUT_SECS = 10
-BLACKLIST_DURATION_SECS = 300
+CHALLENGE_TIMEOUT_SECS = 60
+BLACKLIST_DURATION_SECS = 60
 ANOMALY_SCORE_THRESHOLD = 60
 MAX_HUMAN_SPEED_MS = 3.0
 MAX_VEHICLE_SPEED_MS = 30.0
@@ -162,7 +162,7 @@ def algo_6_anomaly_score(node_id: str, delta: int, reason: str):
     edge_log("EDGE INTEL", f"{node_id} score={score} reason={reason}")
     if score > ANOMALY_SCORE_THRESHOLD:
         post_security_event(node_id, "anomaly_threshold", f"score={score} reason={reason}")
-    if score > 80:
+    if score > 90:
         with state_lock:
             blacklist[node_id] = time.time() + BLACKLIST_DURATION_SECS
         post_l7_alert(node_id, reason, score)
@@ -315,6 +315,9 @@ def challenge_expected(node_id: str, nonce_hex: str) -> str:
 
 
 def challenge_thread():
+    print("[EDGE] Challenge grace period 120s — waiting for nodes...")
+    time.sleep(120)
+    print("[EDGE] Challenge thread active")
     while not stop_event.is_set():
         for node_id in NODE_IDS:
             if node_id not in _node_keys:
@@ -342,7 +345,7 @@ def challenge_thread():
                         break
                 time.sleep(0.2)
             else:
-                score = algo_6_anomaly_score(node_id, 30, "liveness_failure")
+                score = algo_6_anomaly_score(node_id, 10, "liveness_failure")
                 log_security(node_id, "liveness_failure")
                 if score > ANOMALY_SCORE_THRESHOLD:
                     post_l7_alert(node_id, "liveness_failure", score)
@@ -621,18 +624,26 @@ def on_field_message(client, userdata, msg):
     except Exception:
         return
 
+    # Clear expired blacklist entries so reconnecting nodes are not stuck
+    if node_id in blacklist:
+        if time.time() > blacklist[node_id]:
+            with state_lock:
+                blacklist.pop(node_id, None)
+            edge_log("EDGE", f"{node_id} blacklist expired, cleared")
+
     ok, reason = algo_4_whitelist(node_id)
     if not ok:
         log_security(node_id, reason)
         return
 
+    # Challenge responses are internal protocol messages — never rate-limit them
+    if parts[2] == "challenge_response":
+        handle_challenge_response(node_id, data)
+        return
+
     ok, reason = algo_3_rate_limit(node_id)
     if not ok:
         log_security(node_id, reason)
-        return
-
-    if parts[2] == "challenge_response":
-        handle_challenge_response(node_id, data)
         return
 
     if "ciphertext" in data:

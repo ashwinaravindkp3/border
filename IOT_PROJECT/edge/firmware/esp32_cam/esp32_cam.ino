@@ -3,6 +3,7 @@
 #include <esp_camera.h>
 #include <mbedtls/gcm.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
 
 #define NODE_ID    "BORDER_001"
 // Change to "BORDER_002" for the second camera.
@@ -204,6 +205,17 @@ void setup_camera() {
   }
 }
 
+const char* wifi_status_str(int s) {
+  switch(s) {
+    case 0: return "IDLE";
+    case 1: return "NO_SSID";
+    case 3: return "CONNECTED";
+    case 4: return "CONNECT_FAILED";
+    case 6: return "DISCONNECTED";
+    default: return "UNKNOWN";
+  }
+}
+
 void connect_wifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
@@ -231,10 +243,18 @@ void connect_wifi() {
   delay(500);
 
   WiFi.config(static_ip, gateway, subnet);
+  delay(100);  // Static IP config needs settling time
+
+  // Disable power saving — critical for stable connection on ESP32-CAM
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long wifi_start_ms = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("[WIFI] connecting status=%d\n", WiFi.status());
+    int st = WiFi.status();
+    Serial.printf("[WIFI] connecting status=%d (%s)\n", st, wifi_status_str(st));
     if (millis() - wifi_start_ms >= 15000UL) {
       Serial.println("[WIFI] FAILED → restarting");
       ESP.restart();
@@ -269,4 +289,16 @@ void setup() {
 }
 
 void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WIFI] reconnecting");
+    WiFi.disconnect();
+    delay(1000);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    int att = 0;
+    while (WiFi.status() != WL_CONNECTED && att < 20) {
+      delay(500);
+      att++;
+    }
+  }
+  delay(5000);
 }
